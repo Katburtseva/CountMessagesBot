@@ -23,7 +23,7 @@ from aiogram.filters import Command
 from aiogram.enums import ParseMode
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_СВОЙ_ТОКЕН_СЮДА")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8326506470:AAGmKizzO_wKwKBIylJuzu00ZbUYW9B9AEs")
 MSK = timezone(timedelta(hours=3))  # UTC+3, Москва
 DAILY_REPORT_HOUR = 23
 DAILY_REPORT_MINUTE = 59
