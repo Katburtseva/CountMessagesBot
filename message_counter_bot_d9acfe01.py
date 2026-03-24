@@ -15,12 +15,14 @@ Telegram-бот: Счётчик сообщений за день.
 
 import os
 import asyncio
-from datetime import datetime, timedelta, timezone, time
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # ─── Конфигурация ────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8326506470:AAGmKizzO_wKwKBIylJuzu00ZbUYW9B9AEs")
@@ -152,37 +154,17 @@ async def cmd_reset(message: types.Message, bot: Bot) -> None:
 
 
 # ─── Ежедневная отправка статистики в 23:59 МСК ─────────────────────────────
-async def daily_report(bot: Bot) -> None:
-    """Фоновая задача: каждый день в 23:59 МСК отправляет итоги во все чаты."""
-    while True:
-        now = datetime.now(MSK)
-        # Вычисляем время до ближайшего 23:59
-        target = now.replace(
-            hour=DAILY_REPORT_HOUR,
-            minute=DAILY_REPORT_MINUTE,
-            second=0,
-            microsecond=0,
-        )
-        if target <= now:
-            target += timedelta(days=1)
-
-        wait_seconds = (target - now).total_seconds()
-        print(f"⏰ Следующий отчёт через {wait_seconds:.0f} сек. ({target.strftime('%Y-%m-%d %H:%M')} МСК)")
-        await asyncio.sleep(wait_seconds)
-
-        # Отправляем статистику во все чаты, где есть данные
-        current = today()
-        for chat_id in list(stats.keys()):
-            text = build_stats_text(chat_id, current)
-            if text:
-                text = "🕛 <b>Автоматический итог дня</b>\n\n" + text
-                try:
-                    await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
-                except Exception as e:
-                    print(f"⚠️ Не удалось отправить отчёт в чат {chat_id}: {e}")
-
-        # Небольшая пауза, чтобы не сработало дважды
-        await asyncio.sleep(60)
+async def send_daily_report(bot: Bot) -> None:
+    """Отправляет итоговую статистику во все чаты, где были сообщения."""
+    current = today()
+    for chat_id in list(stats.keys()):
+        text = build_stats_text(chat_id, current)
+        if text:
+            text = "🕛 <b>Автоматический итог дня</b>\n\n" + text
+            try:
+                await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                print(f"⚠️ Не удалось отправить отчёт в чат {chat_id}: {e}")
 
 
 # ─── Запуск ──────────────────────────────────────────────────────────────────
@@ -197,8 +179,14 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Запускаем фоновую задачу ежедневного отчёта
-    asyncio.create_task(daily_report(bot))
+    # Планировщик: срабатывает ровно в 23:59 МСК, без цикла
+    scheduler = AsyncIOScheduler(timezone=MSK)
+    scheduler.add_job(
+        send_daily_report,
+        trigger=CronTrigger(hour=DAILY_REPORT_HOUR, minute=DAILY_REPORT_MINUTE),
+        args=[bot],
+    )
+    scheduler.start()
 
     print("✅ Бот запущен! Нажмите Ctrl+C для остановки.")
     print(f"⏰ Ежедневный отчёт будет отправляться в {DAILY_REPORT_HOUR}:{DAILY_REPORT_MINUTE:02d} МСК.")
