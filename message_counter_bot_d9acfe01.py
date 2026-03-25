@@ -1,197 +1,148 @@
 """
-Telegram-бот: Счётчик сообщений за день.
+Telegram-бот: счётчик сообщений за день.
+Считает сообщения каждого участника в чате.
+В 23:59 по МСК автоматически отправляет итоги дня и сбрасывает счётчик.
 
-Считает количество сообщений каждого участника чата за текущий день.
-Команды:
-  /start  — приветствие и инструкция
-  /stats  — статистика сообщений за сегодня
-  /reset  — сброс статистики (только для админов группы)
+Установка зависимостей:
+    pip install python-telegram-bot==20.7 apscheduler==3.10.4
 
-Использование:
-  1. Вставьте свой BOT_TOKEN ниже (или задайте переменную окружения BOT_TOKEN).
-  2. Добавьте бота в групповой чат и дайте ему права на чтение сообщений.
-  3. Запустите: python message_counter_bot.py
+Запуск:
+    BOT_TOKEN=your_token_here python bot.py
 """
 
 import os
-import asyncio
-from datetime import datetime, timedelta, timezone
+import logging
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
-from aiogram import Bot, Dispatcher, Router, types, F
-from aiogram.filters import Command
-from aiogram.enums import ParseMode
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    ContextTypes,
+    filters,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# ─── Конфигурация ────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8326506470:AAGmKizzO_wKwKBIylJuzu00ZbUYW9B9AEs")
-MSK = timezone(timedelta(hours=3))  # UTC+3, Москва
-DAILY_REPORT_HOUR = 23
-DAILY_REPORT_MINUTE = 59
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Настройки ────────────────────────────────────────────────
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8326506470:AAGmKizzO_wKwKBIylJuzu00ZbUYW9B9AEs")
+MSK = timezone(timedelta(hours=3))
 
-router = Router()
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-# Хранилище: {chat_id: {user_id: {"name": str, "count": int, "date": str}}}
-stats: dict[int, dict[int, dict]] = defaultdict(lambda: defaultdict(dict))
+# ── Хранилище ────────────────────────────────────────────────
+# Структура: { chat_id: { user_display_name: count } }
+counters: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+# Запоминаем chat_id всех чатов, где бот активен
+active_chats: set[int] = set()
 
 
-def today() -> str:
-    """Текущая дата по МСК как строка YYYY-MM-DD."""
-    return datetime.now(MSK).strftime("%Y-%m-%d")
-
-
-def get_user_display_name(user: types.User) -> str:
-    """Читаемое имя пользователя."""
-    if user.full_name:
-        return user.full_name
+# ── Вспомогательные функции ──────────────────────────────────
+def get_display_name(user) -> str:
+    """Возвращает читаемое имя пользователя."""
+    if user is None:
+        return "Неизвестный"
+    name = user.full_name or user.first_name or ""
     if user.username:
-        return f"@{user.username}"
-    return f"User {user.id}"
+        name += f" (@{user.username})"
+    return name or "Неизвестный"
 
 
-def ensure_today(chat_id: int, user_id: int, user: types.User) -> None:
-    """Если дата сменилась — обнуляем счётчик пользователя."""
-    current = today()
-    entry = stats[chat_id].get(user_id)
-    if not entry or entry.get("date") != current:
-        stats[chat_id][user_id] = {
-            "name": get_user_display_name(user),
-            "count": 0,
-            "date": current,
-        }
-
-
-# ─── Подсчёт каждого сообщения ──────────────────────────────────────────────
-@router.message(~Command("start", "stats", "reset"))
-async def count_message(message: types.Message) -> None:
-    """Считаем каждое входящее сообщение (кроме команд бота)."""
-    if not message.from_user:
-        return
-
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    ensure_today(chat_id, user_id, message.from_user)
-    stats[chat_id][user_id]["count"] += 1
-    stats[chat_id][user_id]["name"] = get_user_display_name(message.from_user)
-
-
-# ─── /start ──────────────────────────────────────────────────────────────────
-@router.message(Command("start"))
-async def cmd_start(message: types.Message) -> None:
-    await message.answer(
-        "<b>Привет!</b> Я считаю сообщения в этом чате.\n\n"
-        "Просто пишите как обычно — я веду подсчёт автоматически.\n\n"
-        "<b>Команды:</b>\n"
-        "/stats — статистика за сегодня\n"
-        "/reset — сбросить счётчик (только админы)",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ─── Формирование текста статистики (общая функция) ──────────────────────────
-def build_stats_text(chat_id: int, date_str: str | None = None) -> str | None:
-    """Формирует текст статистики за указанную дату. Возвращает None если нет данных."""
-    current = date_str or today()
-
-    today_stats = {
-        uid: data
-        for uid, data in stats.get(chat_id, {}).items()
-        if data.get("date") == current and data.get("count", 0) > 0
-    }
-
-    if not today_stats:
+def build_report(chat_id: int) -> str | None:
+    """Формирует текст отчёта для чата. Возвращает None, если сообщений не было."""
+    data = counters.get(chat_id)
+    if not data:
         return None
 
-    sorted_users = sorted(today_stats.items(), key=lambda x: x[1]["count"], reverse=True)
-    total = sum(d["count"] for _, d in sorted_users)
+    today = datetime.now(MSK).strftime("%d.%m.%Y")
+    total = sum(data.values())
 
-    lines = [f"<b>📊 Статистика за {current}</b>\n"]
-    for i, (uid, data) in enumerate(sorted_users, 1):
-        pct = data["count"] / total * 100 if total else 0
-        bar_len = round(pct / 5)
-        bar = "▓" * bar_len + "░" * (20 - bar_len)
-        lines.append(
-            f"{i}. <b>{data['name']}</b>\n"
-            f"   {bar} {data['count']} сообщ. ({pct:.0f}%)"
-        )
+    lines = [f"📊 Итоги дня ({today})\n"]
+    for name, count in sorted(data.items(), key=lambda x: -x[1]):
+        lines.append(f"  • {name}: {count}")
+    lines.append(f"\nВсего сообщений: {total}")
 
-    lines.append(f"\n<b>Всего:</b> {total} сообщений")
     return "\n".join(lines)
 
 
-# ─── /stats ──────────────────────────────────────────────────────────────────
-@router.message(Command("stats"))
-async def cmd_stats(message: types.Message) -> None:
-    chat_id = message.chat.id
-    text = build_stats_text(chat_id)
-
-    if not text:
-        await message.answer("За сегодня пока нет сообщений (или бот только что добавлен).")
+# ── Обработчики ──────────────────────────────────────────────
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Считает каждое входящее сообщение."""
+    if update.effective_chat is None or update.effective_user is None:
         return
 
-    await message.answer(text, parse_mode=ParseMode.HTML)
+    chat_id = update.effective_chat.id
+    name = get_display_name(update.effective_user)
+
+    counters[chat_id][name] += 1
+    active_chats.add(chat_id)
 
 
-# ─── /reset ──────────────────────────────────────────────────────────────────
-@router.message(Command("reset"))
-async def cmd_reset(message: types.Message, bot: Bot) -> None:
-    chat_id = message.chat.id
-    user_id = message.from_user.id if message.from_user else None
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /stats — показать текущую статистику за сегодня."""
+    if update.effective_chat is None:
+        return
 
-    # В личных чатах разрешаем всем, в группах — только админам
-    if message.chat.type != "private":
-        if user_id:
-            member = await bot.get_chat_member(chat_id, user_id)
-            if member.status not in ("administrator", "creator"):
-                await message.answer("Сбросить статистику могут только администраторы.")
-                return
-
-    stats[chat_id].clear()
-    await message.answer("Статистика сброшена. Подсчёт начнётся заново.")
+    report = build_report(update.effective_chat.id)
+    if report:
+        await update.message.reply_text(report)
+    else:
+        await update.message.reply_text("Сегодня сообщений пока не было.")
 
 
-# ─── Ежедневная отправка статистики в 23:59 МСК ─────────────────────────────
-async def send_daily_report(bot: Bot) -> None:
-    """Отправляет итоговую статистику во все чаты, где были сообщения."""
-    current = today()
-    for chat_id in list(stats.keys()):
-        text = build_stats_text(chat_id, current)
-        if text:
-            text = "🕛 <b>Автоматический итог дня</b>\n\n" + text
+# ── Ежедневная рассылка в 23:59 МСК ─────────────────────────
+async def daily_report(app) -> None:
+    """Отправляет итоги дня во все активные чаты и сбрасывает счётчики."""
+    logger.info("Отправка ежедневного отчёта...")
+
+    for chat_id in list(active_chats):
+        report = build_report(chat_id)
+        if report:
             try:
-                await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+                await app.bot.send_message(chat_id=chat_id, text=report)
             except Exception as e:
-                print(f"⚠️ Не удалось отправить отчёт в чат {chat_id}: {e}")
+                logger.error("Не удалось отправить отчёт в чат %s: %s", chat_id, e)
+
+    # Сброс счётчиков
+    counters.clear()
+    active_chats.clear()
+    logger.info("Счётчики сброшены.")
 
 
-# ─── Запуск ──────────────────────────────────────────────────────────────────
-async def main() -> None:
-    if BOT_TOKEN == "ВСТАВЬТЕ_СВОЙ_ТОКЕН_СЮДА":
-        print("❌ Ошибка: укажите BOT_TOKEN!")
-        print("   Либо задайте переменную окружения: export BOT_TOKEN='ваш_токен'")
-        print("   Либо замените значение прямо в коде.")
-        return
-
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher()
-    dp.include_router(router)
-
-    # Планировщик: срабатывает ровно в 23:59 МСК, без цикла
+# ── Колбэк после старта event loop ───────────────────────────
+async def post_init(app) -> None:
+    """Запускаем планировщик после того, как event loop уже работает."""
     scheduler = AsyncIOScheduler(timezone=MSK)
     scheduler.add_job(
-        send_daily_report,
-        trigger=CronTrigger(hour=DAILY_REPORT_HOUR, minute=DAILY_REPORT_MINUTE),
-        args=[bot],
+        daily_report,
+        trigger=CronTrigger(hour=23, minute=59, timezone=MSK),
+        args=[app],
     )
     scheduler.start()
+    logger.info("Бот запущен. Ежедневный отчёт будет в 23:59 МСК.")
 
-    print("✅ Бот запущен! Нажмите Ctrl+C для остановки.")
-    print(f"⏰ Ежедневный отчёт будет отправляться в {DAILY_REPORT_HOUR}:{DAILY_REPORT_MINUTE:02d} МСК.")
-    await dp.start_polling(bot)
+
+# ── Точка входа ──────────────────────────────────────────────
+def main() -> None:
+    if not BOT_TOKEN:
+        logger.error("Переменная окружения BOT_TOKEN не задана!")
+        return
+
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # Регистрируем обработчики
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    # Считаем все типы сообщений (текст, фото, стикеры и т.д.)
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
+
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
